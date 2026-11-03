@@ -1,0 +1,101 @@
+name: traced-ci
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_failure:
+        description: "Make the test: ui shard fail on this run"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_SERVICE_NAME: traced-ci
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Root span bookkeeping: IDs, start time, and trace context for later steps.
+      # Each step runs in a new shell, so values are passed along via $GITHUB_ENV.
+      - name: Start the trace
+        env:
+          GC_OTLP_ENDPOINT: ${{ secrets.GC_OTLP_ENDPOINT }}
+          GC_OTLP_AUTH: ${{ secrets.GC_OTLP_AUTH }}
+        run: |
+          echo "PIPELINE_START=$(date +%s.%N)" >> "$GITHUB_ENV"
+          TRACE_ID=$(openssl rand -hex 16)
+          ROOT_SPAN_ID=$(openssl rand -hex 8)
+          {
+            echo "TRACE_ID=$TRACE_ID"
+            echo "ROOT_SPAN_ID=$ROOT_SPAN_ID"
+            echo "TRACEPARENT=00-$TRACE_ID-$ROOT_SPAN_ID-01"
+          } >> "$GITHUB_ENV"
+
+          # Only configure an exporter when secrets exist. Without an endpoint,
+          # otel-cli runs in non-recording mode and the workflow still passes.
+          if [ -n "$GC_OTLP_ENDPOINT" ] && [ -n "$GC_OTLP_AUTH" ]; then
+            {
+              echo "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${GC_OTLP_ENDPOINT%/}/v1/traces"
+              echo "OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic $GC_OTLP_AUTH"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::notice::Grafana Cloud secrets not set. otel-cli will run in non-recording mode."
+          fi
+
+          echo "Trace ID: $TRACE_ID"
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install otel-cli
+        run: |
+          go install github.com/equinix-labs/otel-cli@v0.4.5
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # The demo simulates work so it runs anywhere. Swap in your real commands.
+      - name: Install dependencies
+        run: otel-cli exec --name "install deps" --attrs cicd.pipeline.task.type=build -- bash ./scripts/fake-work.sh 3 8
+
+      - name: Unit tests
+        env:
+          # test: ui fails ~20% of runs, or every time when force_failure is set
+          UI_FAIL_PCT: ${{ inputs.force_failure && '100' || '20' }}
+        run: otel-cli exec --name "unit tests" --attrs cicd.pipeline.task.type=test -- bash ./scripts/test.sh
+
+      - name: Build image
+        run: otel-cli exec --name "build image" --attrs cicd.pipeline.task.type=build -- bash ./scripts/fake-work.sh 10 20
+
+      # Runs even after a failure, then writes the root span after the fact.
+      # --tp-ignore-env stops otel-cli from making the root span its own parent.
+      # Context values go through env so the shell never expands ${{ }} inline
+      # (zizmor template-injection).
+      - name: Finish the trace
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PIPELINE_NAME: ${{ github.workflow }}
+          PIPELINE_RUN_ID: ${{ github.run_id }}
+          PIPELINE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if ! command -v otel-cli > /dev/null; then
+            echo "otel-cli not installed, skipping root span."
+            exit 0
+          fi
+          RESULT=success; STATUS=ok
+          if [ "$JOB_STATUS" != "success" ]; then RESULT=failure; STATUS=error; fi
+          otel-cli span --tp-ignore-env \
+            --force-trace-id "$TRACE_ID" --force-span-id "$ROOT_SPAN_ID" \
+            --name "ci pipeline" \
+            --start "$PIPELINE_START" --end "$(date +%s.%N)" \
+            --status-code "$STATUS" \
+            --attrs "cicd.pipeline.name=$PIPELINE_NAME,cicd.pipeline.run.id=$PIPELINE_RUN_ID,cicd.pipeline.result=$RESULT,cicd.pipeline.run.url.full=$PIPELINE_RUN_URL"

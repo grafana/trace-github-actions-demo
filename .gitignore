@@ -1,0 +1,23 @@
+# Secrets and local config
+.env
+.env.*
+*.local
+*.pem
+
+# Local trace output (for example: otel-cli server json --dir ./traces)
+traces/
+*.trace.json
+
+# Locally built binaries
+otel-cli
+bin/
+
+# Dependencies, if you swap in a real app
+node_modules/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
