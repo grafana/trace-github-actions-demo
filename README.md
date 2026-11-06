@@ -14,6 +14,8 @@ ci pipeline          [=========================================]
 
 ## Quickstart (about 5 minutes)
 
+You need the GitHub CLI (`gh`) installed. See [Installing gh](https://github.com/cli/cli#installation).
+
 **1. Fork and clone**
 
 ```bash
